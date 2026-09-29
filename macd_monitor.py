@@ -623,6 +623,86 @@ def send_telegram(bot_token: str, chat_id: str, text: str):
         return False, str(e)
 
 
+
+# ─── AI 總結 Prompt 生成 ─────────────────────────────────
+def build_ai_prompt(summaries: list, timeframe: str, multi_tf: list) -> str:
+    """把所有股票的分析結果整理成一份可直接貼給 AI 的完整 prompt"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # ── 總覽表 ──
+    overview = ["| 代碼 | 收盤 | 漲跌% | MACD | Histogram | 狀態 | 趨勢 | ATR | D+1 | D+2 | D+3 |",
+                "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for x in summaries:
+        overview.append(
+            f"| {x['symbol']} | {x['close']:.2f} | {x['pct']:+.2f}% | {x['macd']:+.3f} | "
+            f"{x['hist']:+.3f} | {x['status']} | {x['trend']} | {x['atr']:.3f} | "
+            f"{x['d1']:+.3f} | {x['d2']:+.3f} | {x['d3']:+.3f} |"
+        )
+
+    # ── 多時框共振表 ──
+    mtf_lines = []
+    if multi_tf:
+        mtf_lines = ["| 代碼 | " + " | ".join(f"{t} 趨勢 (Hist / ATR)" for t in multi_tf) + " | 共振判斷 |",
+                     "|---|" + "---|" * (len(multi_tf) + 1)]
+        for x in summaries:
+            cells, bull, bear = [], 0, 0
+            for t in multi_tf:
+                r = x["mtf"].get(t)
+                if not r:
+                    cells.append("N/A")
+                    continue
+                cells.append(f"{r['trend']} ({r['hist']:+.3f} / {r['atr']:.3f})")
+                if r["hist"] > 0:
+                    bull += 1
+                elif r["hist"] < 0:
+                    bear += 1
+            if bull == len(multi_tf):
+                reso = "全部看多（共振）"
+            elif bear == len(multi_tf):
+                reso = "全部看空（共振）"
+            else:
+                reso = f"分歧（多 {bull} / 空 {bear}）"
+            mtf_lines.append(f"| {x['symbol']} | " + " | ".join(cells) + f" | {reso} |")
+
+    # ── 各股近 5 根明細 ──
+    detail = []
+    for x in summaries:
+        detail.append(f"### {x['symbol']}（{timeframe}）")
+        detail.append("| 日期 | 收盤 | MACD | Histogram | 狀態 |")
+        detail.append("|---|---|---|---|---|")
+        for r in x["recent"]:
+            detail.append(f"| {r['date']} | {r['close']} | {r['macd']} | {r['hist']} | {r['status']} |")
+        detail.append("")
+
+    prompt = f"""你是一位資深美股量化交易分析師。以下是我的 MACD 多股票監控系統在 {now} 產生的完整分析結果，請據此做出總結。
+
+## 一、背景
+- 主時間框架：{timeframe}
+- 多時框共振：{'、'.join(multi_tf) if multi_tf else '未啟用'}
+- MACD 參數 (12, 26, 9)；ATR 週期 14
+- D+1 / D+2 / D+3 是系統以 Histogram 斜率外推的動能預測值（不是價格預測）
+
+## 二、總覽
+{chr(10).join(overview)}
+
+## 三、多時框共振
+{chr(10).join(mtf_lines) if mtf_lines else '（未啟用）'}
+
+## 四、各股近 5 根 K 線明細
+{chr(10).join(detail)}
+
+## 五、請你輸出（繁體中文，結構化表格為主，結論要明確，不要模稜兩可）
+1. **市場整體判斷**：一句話說明整體偏多、偏空或分歧，並列出多頭與空頭股票各有哪些。
+2. **強弱排名表**：依動能強弱由強到弱排序，欄位為 排名 | 代碼 | 方向（做多/做空/觀望） | 信心度（高/中/低） | 一句話理由。
+3. **交易計劃表**：對每檔股票給出 方向 | 參考入場價 | 止損價 | 目標價 | 風險回報比。止損與目標請用 ATR 的倍數換算成具體價格，並寫出換算依據。
+4. **多時框矛盾警示**：找出短線與長線方向相反的股票，說明該聽哪個時間框架。
+5. **最值得優先操作的前 3 檔**，以及明確要避開的股票。
+6. **風險提示**：列出會讓上述判斷失效的具體條件（例如 Histogram 翻負、跌破某價位）。
+
+限制：只能根據上面的數據推論，不得編造未提供的新聞或財報；數據不足時請明確說明。"""
+    return prompt
+
+
 # ─── Sidebar ──────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚙️ 設定")
@@ -684,6 +764,7 @@ st.markdown("---")
 # ─── 主循環：每個股票 ─────────────────────────────────────
 tf_cfg = TIMEFRAME_MAP[timeframe]
 tg_messages_all = []
+ai_summaries = []   # 供 AI 總結 prompt 使用
 
 for symbol in symbols:
     st.markdown(f"## 🔷 {symbol}")
@@ -756,6 +837,26 @@ for symbol in symbols:
     table_html = render_table_html(df_table)
     st.markdown(table_html, unsafe_allow_html=True)
 
+    # ── 收集本檔分析結果（供 AI 總結） ───────────────────
+    prev_close = df["Close"].iloc[-2]
+    sym_summary = {
+        "symbol": symbol,
+        "close": close_val,
+        "pct": (close_val - prev_close) / prev_close * 100,
+        "macd": macd_val,
+        "hist": float(hist_val),
+        "status": status_val,
+        "trend": trend,
+        "atr": float(calc_atr(df)),
+        "d1": float(d1), "d2": float(d2), "d3": float(d3),
+        "recent": [
+            {"date": r["日線"], "close": r["收盤"], "macd": r["MACD"],
+             "hist": fmt(r["_hist_val"], 3), "status": r["_status"]}
+            for _, r in df_table.tail(5).iterrows()
+        ],
+        "mtf": {},
+    }
+
     # ── 多時框共振 ──────────────────────────────────────
     if multi_tf:
         st.markdown("#### 🔗 多時框共振")
@@ -776,6 +877,7 @@ for symbol in symbols:
             h_cls = "pos" if hv >= 0 else "neg"
             atr_val = calc_atr(df_tf)
             td1, td2, td3 = predict_next3(h_tf)
+            sym_summary["mtf"][tf] = {"trend": tr_tf, "hist": float(hv), "atr": float(atr_val)}
 
             def _pred_span(v):
                 cls = "pos" if v >= 0 else "neg"
@@ -822,10 +924,26 @@ for symbol in symbols:
     # ── Telegram 信號預覽 ───────────────────────────────
     tg_msg = build_telegram_signal(symbol, df_table, macd_val, hist_val, trend, timeframe, d1, d2, d3)
     tg_messages_all.append(tg_msg)
+    ai_summaries.append(sym_summary)
 
     with st.expander(f"📡 Telegram 信號預覽 — {symbol}"):
         st.markdown(f'<div class="tg-box">{tg_msg}</div>', unsafe_allow_html=True)
 
+    st.markdown("---")
+
+
+# ─── AI 總結 Prompt ──────────────────────────────────────
+if ai_summaries:
+    st.markdown("## 🤖 AI 總結 Prompt")
+    st.caption("已自動整合所有股票、所有時間框架的分析結果。點右上角複製，貼到 Claude / ChatGPT 即可。")
+    ai_prompt_text = build_ai_prompt(ai_summaries, timeframe, multi_tf)
+    st.code(ai_prompt_text, language="markdown")
+    st.download_button(
+        "⬇️ 下載 Prompt (.txt)",
+        data=ai_prompt_text,
+        file_name=f"macd_ai_prompt_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+        mime="text/plain",
+    )
     st.markdown("---")
 
 
