@@ -192,7 +192,7 @@ TIMEFRAME_MAP = {
     "1mo": {"period": "5y",  "interval": "1mo"},
 }
 
-DEFAULT_SYMBOLS = ["QQQ", "TSLA", "TSLL", "SPCX", "AAPL", "GOOGL", "XPEV", "NIO", "META", "MSFT", "NVDA", "AMD", "INTC", "TSM", "XOM" , "VST", "RKLB", "ARM", "SNDK","MU","NKE","AVGO"]
+DEFAULT_SYMBOLS = ["QQQ", "TSLA", "TSLL", "SPCX", "AAPL", "GOOGL", "XPEV", "NIO", "META", "MSFT", "NVDA", "AMD", "INTC", "TSM", "VST", "RKLB", "MU","NKE","AVGO"]
 
 
 # ─── 核心計算函式 ─────────────────────────────────────────
